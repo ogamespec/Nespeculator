@@ -92,10 +92,24 @@ int cart_load(Cart *cart, struct Nes *nes, const char *path)
 
     cart->prg_banks_16k = file[4];
     cart->chr_banks_8k = file[5];
-    if (cart->prg_banks_16k == 0 && cart->nes2)
-        cart->prg_banks_16k = (uint8_t)((flags9 & 0x0F) | 0x10);
-    if (cart->chr_banks_8k == 0 && cart->nes2)
-        cart->chr_banks_8k = (uint8_t)((flags9 >> 4) | 0x10);
+    if (cart->nes2) {
+        /* NES 2.0 byte 9 carries the upper bits of both size fields:
+         * PRG = (MSB << 8) | byte 4 (16 KB units), CHR = (MSB << 8) | byte 5
+         * (8 KB units).  A zero nibble means the field is just byte 4/5, so a
+         * zero CHR-ROM size means CHR-RAM.  The previous `| 0x10` turned the
+         * all-zero CHR fields of a CHR-RAM image into 16 CHR-ROM banks
+         * (128 KB), which made every NES 2.0 CHR-RAM ROM - including all of
+         * the nes-audio-tests builds - fail to load. */
+        uint32_t prg_banks = (uint32_t)file[4] | ((uint32_t)(flags9 & 0x0F) << 8);
+        uint32_t chr_banks = (uint32_t)file[5] | ((uint32_t)(flags9 >> 4) << 8);
+        if (prg_banks > 0xFFu || chr_banks > 0xFFu) {
+            /* Larger than the loader's bank counters can describe. */
+            free(file);
+            return CART_ERR_FORMAT;
+        }
+        cart->prg_banks_16k = (uint8_t)prg_banks;
+        cart->chr_banks_8k = (uint8_t)chr_banks;
+    }
 
     cart->battery = (flags6 & 0x02) != 0;
     cart->four_screen = (flags6 & 0x08) != 0;

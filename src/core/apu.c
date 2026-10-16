@@ -21,21 +21,33 @@ const uint8_t apu_length_table[32] = {
     12,  16, 24,  18, 48,  20, 96,  22, 192,  24, 72,  26, 16, 28, 32, 30
 };
 
-/* Duty sequences (03-apu-pulse.md section 2), indexed by the 3-bit *down*
- * counter whose value is 7 first, then 6 ... 0. */
+/* Duty sequences as the die decodes them (square.v SQUARE_Duty):
+ *   in[0] = DC0 & DC1 & DC2, in[1] = DC1 & DC2, in[2] = DC2,
+ *   in[3] = ~(DC1 & DC2)
+ * The 3-bit counter is loaded with 0 by $4003/$4007 and then counts *down*,
+ * so the table is indexed by the current counter value and the published
+ * sequence is played as 0,7,6,5,4,3,2,1 - the community tables are the same
+ * waveform rotated, which moves the phase after every $4003 write. */
 static const uint8_t apu_duty[4][8] = {
-    { 0, 1, 0, 0, 0, 0, 0, 0 }, /* 12.5% */
-    { 0, 1, 1, 0, 0, 0, 0, 0 }, /* 25%   */
-    { 0, 1, 1, 1, 1, 0, 0, 0 }, /* 50%   */
-    { 1, 0, 0, 1, 1, 1, 1, 1 }  /* 25% negated */
+    { 0, 0, 0, 0, 0, 0, 0, 1 }, /* 12.5%          */
+    { 0, 0, 0, 0, 0, 0, 1, 1 }, /* 25%            */
+    { 0, 0, 0, 0, 1, 1, 1, 1 }, /* 50%            */
+    { 1, 1, 1, 1, 1, 1, 0, 0 }  /* 25% negated    */
 };
 
-/* Noise period tables: period in CPU cycles (03-apu-noise.md section 3). */
+/* Noise period tables.  The published tables (03-apu-noise.md section 3) are
+ * in CPU cycles, but noise.v clocks the noise frequency counter from ACLK4
+ * (the APU cycle, i.e. every 2 CPU cycles), and the counter reloads after
+ * exactly NNF APU cycles.  The hardware NNF values derived from the
+ * NOISE_Decoder1/NOISE_Decoder2 PLA equal the published CPU-cycle periods
+ * divided by two, so these tables are the APU-cycle periods.  Using the
+ * CPU-cycle figures in an APU-cycle counter doubled every period (a full
+ * octave low) and added one extra APU cycle per shift. */
 static const uint16_t apu_noise_period_ntsc[16] = {
-    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
+    2, 4, 8, 16, 32, 48, 64, 80, 101, 127, 190, 254, 381, 508, 1017, 2034
 };
 static const uint16_t apu_noise_period_pal[16] = {
-    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778
+    2, 4, 7, 15, 30, 44, 59, 74, 94, 118, 177, 236, 354, 472, 945, 1889
 };
 
 /* DMC rate tables: period in CPU cycles (03-apu-dmc.md section 3). */
@@ -202,7 +214,15 @@ void apu_reset(Apu *apu)
     apu->dmc.loop = false;
     apu->dmc.rate_index = 0;
     apu->dmc.rate_counter = 0;
-    apu->dmc.sample_addr = 0x4000; /* $C000 */
+    /* The DMC's $4012/$4013 reload shadows have no reset in the die (plain
+     * registers power up at 0), so a channel enabled before either is written
+     * plays one byte from $C000 + 64*0 = $C000.  Leaving the shadows at 0 made
+     * the emulator fetch from $0000 and, because $4013 = 0 means "0 bytes" in
+     * the shadow instead of the hardware's 16*0+1 = 1 byte, refuse to fetch at
+     * all ($4015 bit 4 stayed set and no IRQ was ever raised). */
+    apu->dmc_sample_base = 0xC000;
+    apu->dmc_sample_len = 1;
+    apu->dmc.sample_addr = 0xC000;
     apu->dmc.sample_len = 0;
     apu->dmc.sample_buffer = 0;
     apu->dmc.buffer_full = false;
@@ -350,21 +370,18 @@ static void frame_counter_clock(Apu *apu)
     if (e->quarter) quarter_clock(apu);
     if (e->half) half_clock(apu);
 
-    /* The $4015 bit-6 flag is set by every frame-counter IRQ activation, even
-     * while the interrupt is inhibited: AccuracyCoin's "Frame Counter IRQ"
-     * tests I/J/K read it at cycles 29828, 29829 and 29830.  The CPU /IRQ line
-     * is a separate signal and only follows when the interrupt is enabled; the
-     * terminal activation clears the flag instead while inhibited (test L).
-     * An activation also cancels a pending $4015-read clear (tests E-H). */
+    /* clkgen.v wires mask_clear ($4017 bit 6) to int_ff's asynchronous reset,
+     * so while the interrupt is inhibited the flag cannot be set at all: $4015
+     * bit 6 reads 0 and the CPU /IRQ line never asserts while the inhibit is
+     * held.  The emulator used to set the flag regardless and gate only the
+     * /IRQ line, which made $4015 bit 6 read 1 for the two CPU cycles of the
+     * IRQ activation in every frame.  An activation also cancels a pending
+     * $4015-read clear. */
     if (e->irq) {
         apu->frame_irq_clear_pending = false;
-        if (e->irq == 2 && apu->frame_irq_inhibit) {
-            apu->frame_irq = false;
-            apu->frame_irq_line = false;
-        } else {
+        if (!apu->frame_irq_inhibit) {
             apu->frame_irq = true;
-            if (!apu->frame_irq_inhibit)
-                apu->frame_irq_line = true;
+            apu->frame_irq_line = true;
         }
     }
 
@@ -432,7 +449,10 @@ void apu_dmc_fetch_complete(Apu *apu, uint8_t value)
     ApuDmc *d = &apu->dmc;
     d->sample_buffer = value;
     d->buffer_full = true;
-    d->silence = false;
+    /* `silence` tracks the output unit's step flip-flop, which only BLOAD
+     * (loading the byte into the shift register at a bit-counter boundary)
+     * clears - fetching into the sample buffer does not start the output unit
+     * (dpcm.v DPCM_SampleBufferControl). */
     /* Byte consumed: the counter decrements and the address advances
      * (03-apu-dmc.md section 5).  The channel is *not* disabled here: the
      * fetched bytes still have to play out, and $4015 bit 4 stays set until
@@ -524,12 +544,35 @@ static void dmc_step(Apu *apu)
 
 /* ---------------------------------------------------------------- channels -- */
 
+/* Recompute SQA/SQB from the current duty counter value.  The gate mirrors
+ * square.v SQUARE_Output: the latch output is DUTY & ~SW_UVF & ~NOSQ &
+ * ~SW_OVF, then LOCK clears it, and the volume/envelope nibble is passed
+ * through.  Called both from pulse_step() and from a $4003/$4007 write, since
+ * the hardware decode is combinational and a phase reset therefore shows the
+ * counter's zero state immediately (square.v SQUARE_Duty). */
+static void pulse_refresh_output(Apu *apu, int idx)
+{
+    ApuPulse *p = &apu->pulse[idx];
+    bool nosq = (p->length == 0);
+    bool underflow = (p->timer & 0x7FC) == 0;
+    bool overflow = false;
+    uint8_t vol;
+
+    if (!p->sweep_negate) {
+        uint16_t target = (uint16_t)(p->timer >> p->sweep_shift);
+        if ((uint32_t)p->timer + target > 0x7FF) overflow = true;
+    }
+    vol = p->constant_volume ? p->volume : p->env_decay;
+    if (apu_duty[p->duty & 3][p->duty_counter & 7] &&
+        !nosq && !underflow && !overflow && !apu->lock)
+        p->output = vol;
+    else
+        p->output = 0;
+}
+
 static void pulse_step(Apu *apu, int idx)
 {
     ApuPulse *p = &apu->pulse[idx];
-    uint8_t duty_bit;
-    bool nosq, underflow, overflow, gate;
-    uint8_t vol;
 
     if (p->timer_counter == 0) {
         p->timer_counter = p->timer;
@@ -537,18 +580,7 @@ static void pulse_step(Apu *apu, int idx)
     } else {
         p->timer_counter--;
     }
-
-    duty_bit = apu_duty[p->duty & 3][p->duty_counter & 7];
-    nosq = (p->length == 0);
-    underflow = (p->timer & 0x7FC) == 0;
-    {
-        uint16_t target = p->timer >> p->sweep_shift;
-        overflow = false;
-        if (!p->sweep_negate && ((uint32_t)p->timer + target) > 0x7FF) overflow = true;
-    }
-    gate = duty_bit && !nosq && !underflow && !overflow && !apu->lock;
-    vol = p->constant_volume ? p->volume : p->env_decay;
-    p->output = gate ? vol : 0;
+    pulse_refresh_output(apu, idx);
 }
 
 static void triangle_step(Apu *apu)
@@ -576,6 +608,12 @@ static void noise_step(Apu *apu)
                         : apu_noise_period_pal[n->period_index & 0x0F];
     uint8_t vol;
 
+    /* The frequency counter reloads itself when it has counted down to its
+     * last state, so the shift lands exactly `period` APU cycles after the
+     * previous one (noise.v NOISE_FreqLFSR: NFLOAD fires while the counter
+     * holds its terminal value). */
+    if (n->timer_counter > 0)
+        n->timer_counter--;
     if (n->timer_counter == 0) {
         uint16_t tap;
         uint16_t feedback;
@@ -587,12 +625,14 @@ static void noise_step(Apu *apu)
         if ((n->lfsr & 0x7FFF) == 0) feedback = 1;
         n->lfsr = (uint16_t)((n->lfsr >> 1) | (feedback << 14));
         if ((n->lfsr & 0x7FFF) == 0) n->lfsr = 1;
-    } else {
-        n->timer_counter--;
     }
 
+    /* noise.v NOISE_RandomLFSR: RNDOUT = (sout[0] | NORND) & ~LOCK and
+     * RND_out = ~(~Vol | {4{RNDOUT}}), so the channel is silenced while bit 0
+     * of the shift register is *set* - the opposite of the pulse channels'
+     * DUTY polarity. */
     vol = n->constant_volume ? n->volume : n->env_decay;
-    if ((n->lfsr & 1) == 0 || n->length == 0 || apu->lock)
+    if ((n->lfsr & 1) != 0 || n->length == 0 || apu->lock)
         n->output = 0;
     else
         n->output = vol;
@@ -637,6 +677,9 @@ void apu_write(Apu *apu, uint16_t addr, uint8_t value)
         if (p->enabled) p->length = apu_length_table[value >> 3];
         p->env_start = true;
         p->duty_counter = 0;
+        /* The duty decode is combinational, so the phase reset is audible on
+         * the same cycle rather than at the next timer reload. */
+        pulse_refresh_output(apu, addr == 0x4003 ? 0 : 1);
         break;
     }
     case 0x4008:
@@ -672,8 +715,15 @@ void apu_write(Apu *apu, uint16_t addr, uint8_t value)
         apu->dmc.rate_index = (uint8_t)(value & 0x0F);
         break;
     case 0x4011:
+        /* A direct load only rewrites the DAC register.  It must not restart
+         * the output unit: dpcm.v gates DSTEP with the step flip-flop that
+         * BLOAD (a byte arriving in the shift register) sets, so a $4011
+         * write with no sample playing leaves the level alone.  Clearing
+         * `silence` here made the idle output unit shift its stale shift
+         * register out and walk the level down by 2 every bit period, which
+         * corrupts every $4011-driven DAC level (dac_tnd0-3 write $4011
+         * continuously and never start a DMC sample). */
         apu->dmc.output = (uint8_t)(value & 0x7F);
-        apu->dmc.silence = false;
         break;
     case 0x4012:
         /* The write loads the sample-address *reload* register only; the
@@ -711,10 +761,14 @@ void apu_write(Apu *apu, uint16_t addr, uint8_t value)
              * Channel" test 4). */
             apu->dmc.sample_addr = apu->dmc_sample_base;
             apu->dmc.sample_len = apu->dmc_sample_len;
-            /* The output unit keeps running; only the sample buffer is
-             * discarded, and the shift register is refilled at the next output
-             * cycle end. */
-            apu->dmc.buffer_full = false;
+            /* A byte already waiting in the sample buffer is *kept*: in dpcm.v
+             * stop_ff (CTRL1) is set only by PCM and cleared only by BLOAD, and
+             * start_set requires it clear, so a disable -> enable while a byte
+             * waits issues no fetch at all - the stale byte plays first and the
+             * next fetch, from the reloaded address, only happens once BLOAD has
+             * emptied the buffer.  Discarding it here made the emulator fetch
+             * `base` immediately and play [base][base+1]... instead of the
+             * hardware's [stale][base][base+1]... */
         }
         if (!apu->dmc.enabled && was_enabled) {
             /* Playback stopped explicitly: the DMC abort bug needs to know
@@ -838,18 +892,22 @@ void apu_frame_tick(Apu *apu)
 
     /* In-flight $4017 writes: each restarts the sequencer (and, in 5-step
      * mode, emits a quarter and a half frame clock) 3 or 4 CPU cycles after
-     * its write cycle. */
+     * its write cycle.  In clkgen.v the immediate clock is the Z2 pulse in the
+     * nACLK2 phase of the cycle *before* F1 reloads the LFSR, so it lands one
+     * CPU cycle ahead of the restart. */
     n = 0;
     for (i = 0; i < apu->frame_reset_count; i++) {
         ApuFrameReset fr = apu->frame_reset[i];
-        if (--fr.delay <= 0) {
+        fr.delay--;
+        if (fr.delay == 1 && fr.mode) {
+            /* One CPU cycle before the restart: the Z2 pulse. */
+            quarter_clock(apu);
+            half_clock(apu);
+        }
+        if (fr.delay <= 0) {
             const ApuFrameEvent *ev = apu_frame_events(apu);
             apu->frame_event = 0;
             apu->frame_cycles = ev[0].at;
-            if (fr.mode) {
-                quarter_clock(apu);
-                half_clock(apu);
-            }
         } else {
             apu->frame_reset[n++] = fr;
         }
@@ -903,12 +961,16 @@ float apu_mix(Apu *apu)
     if (g_b > 217) g_b = 217;
     va = apu_auxa[g_a];
     vb = apu_auxb[g_b];
-    /* AUX A full scale 357.14 mV and AUX B 1088.26 mV; the board-level summing
-     * network is not described by the specification (SPEC GAP MIX-3), so the
-     * two pins are weighted to roughly equal perceived level.  Both the tables
-     * and the full-scale constants are in mV, and the result is unipolar
-     * 0..~1: silence sits at ~0.0009 (the DAC's unloaded 0.5 mV). */
-    return (va / 357.14f) * 0.45f + (vb / 1088.26f) * 0.55f;
+    /* AUX A and AUX B are two separate pins (dac.v DAC_Square / DAC_Others)
+     * that the board sums through one network, so each contributes in
+     * proportion to its own pin voltage.  The previous normalise-then-weight
+     * version (va/357.14*0.45 + vb/1088.26*0.55) scaled AUX B down by 1088/357
+     * a second time and left a single full-volume pulse channel ~2.5x louder
+     * than a full-volume triangle; on hardware it is the triangle that is
+     * louder (db_apu compares exactly this pair, and the community mixer model
+     * gives 0.149 : 0.247 for it).  The result is unipolar 0..1: silence sits
+     * at (0.5+0.5)/1445.4 and both channels at full scale reach 1.0. */
+    return (va + vb) / (357.14f + 1088.26f);
 }
 
 /* ---------------------------------------------------- audio sample capture -- */
