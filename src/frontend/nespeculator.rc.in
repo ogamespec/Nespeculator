@@ -1,0 +1,8 @@
+/* nespeculator.rc.in - Windows resource script, configured by CMake.
+ *
+ * Embeds the emulator icon so Explorer, the taskbar and the window title bar
+ * all pick it up from the executable itself.  The path is substituted with the
+ * native location of artwork/nespeculator.ico at configure time. */
+#include <windows.h>
+
+IDI_ICON1 ICON "@NES_ICON_RC_PATH@"

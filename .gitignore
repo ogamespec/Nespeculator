@@ -1,0 +1,45 @@
+# --------------------------------------------------------------- build ------
+# CMake/Ninja output.  build.bat recreates this directory on a fresh clone.
+/build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# The executable itself, wherever it ends up.
+/Nespeculator.exe
+*.exe
+
+# ------------------------------------------------------- emulator output ----
+# Framebuffer/RAM dumps, screenshots and bus logs produced by the automation
+# flags and by tools/.  The directory is kept (with .gitkeep) because the
+# frontend and the tools write into it.
+/shots/*
+!/shots/.gitkeep
+*.raw
+*.raw.ram
+*.raw.chr
+*.raw.ciram
+*.raw.info
+*.bus
+*.log
+
+# Local ROMs and captures that happen to sit in the tree.
+*.nes
+
+# -------------------------------------------------------------- editors -----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# ------------------------------------------------------------------ OS ------
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# -------------------------------------------------------------- python ------
+__pycache__/
+*.pyc
