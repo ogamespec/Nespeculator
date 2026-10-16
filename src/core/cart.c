@@ -225,21 +225,25 @@ static uint8_t prg_read(Cart *cart, uint16_t addr)
         off = (uint32_t)(addr - 0x8000);
         if (cart->prg_size == 16384) off &= 0x3FFF;
         break;
-    case 1:
-        if (addr < 0xC000) {
-            switch ((cart->reg[0] >> 2) & 3) {
-            case 0: case 1: off = (uint32_t)(addr - 0x8000); break;
-            case 2: off = 0; break;
-            default: off = cart->prg_bank_lo * 16384u + (uint32_t)(addr - 0x8000); break;
-            }
+    case 1: {
+        /* MMC1 PRG windowing, selected by control-register bits 2-3:
+         *   0, 1 = 32 KB at $8000-$FFFF, bank number bit 0 not wired
+         *   2    = fixed first 16 KB at $8000, switchable 16 KB at $C000
+         *   3    = switchable 16 KB at $8000, fixed last 16 KB at $C000
+         * The 32 KB case used to ignore the bank register completely and always
+         * expose the first 32 KB. */
+        uint32_t mode = (cart->reg[0] >> 2) & 3;
+        if (mode <= 1) {
+            off = (cart->prg_bank_lo & ~1u) * 16384u + (uint32_t)(addr - 0x8000);
+        } else if (addr < 0xC000) {
+            off = (mode == 2) ? 0
+                              : cart->prg_bank_lo * 16384u + (uint32_t)(addr - 0x8000);
         } else {
-            switch ((cart->reg[0] >> 2) & 3) {
-            case 0: case 1: off = (uint32_t)(addr - 0xC000); break;
-            case 2: off = cart->prg_bank_lo * 16384u + (uint32_t)(addr - 0xC000); break;
-            default: off = cart->prg_bank_hi * 16384u + (uint32_t)(addr - 0xC000); break;
-            }
+            off = (mode == 2) ? cart->prg_bank_lo * 16384u + (uint32_t)(addr - 0xC000)
+                              : cart->prg_bank_hi * 16384u + (uint32_t)(addr - 0xC000);
         }
         break;
+    }
     case 2:
         if (addr < 0xC000)
             off = cart->prg_bank_lo * 16384u + (uint32_t)(addr - 0x8000);
@@ -378,7 +382,6 @@ static void mmc1_write(Cart *cart, uint16_t addr, uint8_t value)
         return;
     }
     {
-        bool fifth = (cart->shift & 1) != 0;
         cart->shift = (uint8_t)((cart->shift >> 1) | ((value & 1) << 4));
         cart->shift_count++;
         if (cart->shift_count == 5) {
@@ -395,11 +398,16 @@ static void mmc1_write(Cart *cart, uint16_t addr, uint8_t value)
                     case 3: cart->mirroring = MIRROR_HORIZONTAL; break;
                 }
             } else if (reg == 3) {
+                /* PRG bank register: bits 0-3 hold the 16 KB bank number for
+                 * the switchable window (bit 4 is only wired on boards with
+                 * more than 256 KB of PRG).  Bit 0 goes to the ROM's A14 and is
+                 * therefore NOT a "32 KB board" marker: clearing it here made
+                 * every odd 16 KB bank unreachable, so a game that switches to
+                 * bank 3 (Darkwing Duck does) silently read bank 2 and crashed.
+                 * The one place bit 0 really is unused is the 32 KB modes,
+                 * which prg_read handles by masking the bank itself. */
                 uint32_t banks = cart->prg_size / 16384;
-                if (data & 0x10) cart->prg_bank_lo = data & 0x0F;
-                else cart->prg_bank_lo = (uint32_t)(data & 0x0F) & ~1u;
-                if (banks) cart->prg_bank_lo %= banks;
-                (void)fifth;
+                cart->prg_bank_lo = banks ? (uint32_t)(data & 0x1F) % banks : 0;
             }
         }
     }
